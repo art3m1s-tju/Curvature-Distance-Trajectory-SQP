@@ -1,48 +1,83 @@
-# Curvature-Distance-Trajectory-SQP
+# Global Time-Optimal Racing Trajectory Planning via SQP
 
-## 项目简介 (Description)
-Global time-optimal racing trajectory generation via sparse Sequential Quadratic Programming (OSQP solver).
-本项目是对《Global minimum time trajectory planning considering curvature and distance for track racing》论文算法的完整 Python 复现，并采用现代高效的 OSQP 稀疏二次规划求解器实现了核心的 SQP 迭代。
+## 1. 项目简介 (Overview)
 
-## 项目背景 (Project Background)
-论文## 最新改进与功能 (Latest Improvements)
+本项目是对顶级赛车轨迹规划算法《Global minimum time trajectory planning considering curvature and distance for track racing》的深度 Python 复现。
 
-本项目最近进行了重大更新，以更精准地复现论文描述的物理约束和数值稳定性：
+核心采用 **序列二次规划 (Sequential Quadratic Programming, SQP)** 框架，结合 **OSQP (Operator Splitting Quadratic Program)** 这一现代、高效的稀疏二次规划求解器，实现了针对大规模赛道地图（3000+ 控制点）的秒级最优轨迹生成。
 
-### 1. 严格复现物理占用约束 (Formula 23 & 24)
-- **动态车身宽度计算 (w_v)**：实现了论文公式 (23)，根据车辆的长宽 (`l_v`, `b_v`) 以及当前轨迹的实时航向角，动态计算车辆在赛道横截面上的投影宽度。
-- **边界法向量投影约束**：实现了论文公式 (24)，通过计算赛道内、外边界的单位法向量 ($n_I, n_O$)，将车辆宽度约束投影到从内边界指向外边界的方向向量 $v$ 上，从而精确定义每个决策点的 $\alpha$ 允许范围。
-- **论文公式纠错**：在复现过程中，我们发现并修正了原论文公式 (24) 中的一个严重数学笔误（原公式分子多乘了一个 $|v_i|$ 导致量纲错误），修正后轨迹不再被困在赛道中心，而是能够完美实现切弯。
+## 2. 核心数学原理 (Mathematical Foundations)
 
-### 2. 数值稳定性优化 (SQP Relaxation)
-- **松弛步长控制 (Damping)**：为了解决纯曲率优化 ($\epsilon=0$) 时可能出现的振荡不收敛问题，在 SQP 迭代中引入了松弛因子 $\gamma=0.5$。每一轮的更新量只采用计算结果的一半，有效抑制了非线性项引起的跳变。
-- **高维稀疏矩阵处理**：利用 `scipy.sparse` 对所有 Hessian 和 Jacobi 矩阵进行稀疏化存储，确保即使在 3000+ 控制点的大型赛道上也能实现秒级求解。
+本项目不仅实现了基本的样条曲率优化，还完整还原了论文中复杂的物理占用约束。
 
-### 3. 可视化升级
-- **多维度细节图**：输出的 `trajectory_comparison.png` 升级为 24x20 高清大图，包含：
-  - **全赛道概览 (Full Track Overview)**
-  - **关键弯道放大细节 (Corner Zoom-in)**
-  - **Alpha 决策变量分布 (Alpha Distribution)**：直观展示赛车在不同路段相对于赛道中心的偏离程度。
+### 2.1 目标函数构成 (Cost Function)
+优化目标由两部分组成：
+$$J = J_k + \epsilon J_s$$
+- **$J_k$ (Curvature Factor)**: 最小化路径曲率。通过三次样条 (Cubic Splines) 近似二阶导数矩阵 $M$，从而将曲率惩罚转化为关于决策变量 $\alpha$ 的二次型 $1/2 \alpha^T H_k \alpha + f_k^T \alpha$。
+- **$J_s$ (Distance Factor)**: 最小化行驶路程。通过一阶差分矩阵 $A$ 计算相邻点间距离。
+- **$\epsilon$ (Weight)**: 平衡因子。$\epsilon=0$ 为极致切弯（最小曲率线），$\epsilon > 1000$ 为极致路程节省（几何中心线）。
 
-## 数学与代码的映射关系 (Code & Math Mapping)
+### 2.2 物理占用约束与公式纠错 (Exact Physical Constraints)
 
-1. **车辆物理尺寸 (Section 3.6)**:
-   涉及函数 `calculate_wv_per_point`。考虑了车辆对角线长度及其在横向截面的投影。
+本实现严格执行了论文第 3.6 和 3.7 节的复杂几何约束：
 
-2. **精确 alpha 边界 (Section 3.7)**:
-   涉及函数 `calculate_boundary_normals` 和 `optimize_trajectory` 内部循环。计算了由公式 (24) 定义的非线性变化上下界。
+#### 2.2.1 动态有效车宽 (Formula 23)
+考虑车辆在弯道中的侧向投影，有效宽度 $w_v$ 为：
+$$w_v = \frac{\sqrt{l_v^2 + b_v^2}}{2} |\cos(\theta_{vd} - \theta_{veh})|$$
+代码通过实时的轨迹切线斜率动态计算 `angle_vehicle`，从而确保在每一个迭代步，车身占用的赛道面积都是精确计算的。
 
-... (其他映射关系同前)
+#### 2.2.2 投影约束边界 (Formula 24)
+为了将三维车辆约束投影到二维 $\alpha$ 比例系数上，我们通过计算边界法向量 $n_I, n_O$：
+$$\frac{w_v + w_s}{n_{Ii} \cdot v_i} \le a_i \le 1 - \frac{w_v + w_s}{n_{Oi} \cdot v_i}$$
 
-## 运行方式 (Usage)
+> [!IMPORTANT]
+> **公式修正说明**：原论文公式 (24) 分子中包含 $|v_i|$ 乘子。在复现过程中我们通过量纲分析证实这是一个**印刷错误**。按原公式会导致 $\alpha$ 约束远超 0-1 范围，导致车辆被死锁在中心。本项目已移除该错误乘子，完美恢复了“外-内-外”走线。
 
-1. 确保已安装依赖：`pip install numpy pandas scipy osqp matplotlib`
-2. 运行脚本：`python reproduce_paper.py`
-3. 检查生成的 `trajectory_comparison.png`
+### 2.3 SQP 稳定性优化 (Damping)
+为了解决非线性耦合带来的迭代振荡，我们在每轮迭代引入了松弛因子 $\gamma = 0.5$：
+$$\alpha_{ref}^{(k+1)} = (1-\gamma)\alpha_{ref}^{(k)} + \gamma\alpha_{new}$$
 
-## 分析与讨论 (Discussion)
-通过最新的高清对比图可以看到：
-- **最小曲率轨迹 (Red Line)**：表现出极端的切弯倾向。由于公式 (24) 的精确约束，车辆会在不发生碰撞的前提下，尽早进入弯心并尽可能晚地贴合外侧，以保持最大的弯道半径。
-- **平衡轨迹 (Blue Line)**：权衡了路程和曲率。在长直道段更倾向于走几何中心，而在急弯处则会采取适度的切弯策略。
-- **Alpha 分布**：可以观察到在直道处 $\alpha$ 趋向 0.5，而在左转弯处 $\alpha$ 迅速变化以贴合内侧边界，证明了非线性 SQP 的有效性。
+## 3. 环境准备 (Installation)
 
+本项目依赖经典的科学计算栈 python 3.8+：
+
+```bash
+# 克隆仓库
+git clone https://github.com/art3m1s-tju/Curvature-Distance-Trajectory-SQP.git
+cd Curvature-Distance-Trajectory-SQP
+
+# 安装依赖
+pip install numpy pandas scipy matplotlib osqp
+```
+
+## 4. 运行指南 (Getting Started)
+
+### 4.1 快速运行
+直接执行主脚本，它会自动加载 `track.csv` 并分别计算两种权重下的轨迹：
+```bash
+python reproduce_paper.py
+```
+
+### 4.2 数据格式说明
+如果是使用自定义赛道，请确保 `track.csv` 包含以下列：
+- `left_border_x`, `left_border_y`: 内边界坐标
+- `right_border_x`, `right_border_y`: 外边界坐标
+
+## 5. 结果可视化 (Visualization)
+
+运行后将生成高清大图 `trajectory_comparison.png`，包含四个子板块：
+1. **Full Track Overview**: 全赛道宏观走线对比。
+2. **Corner Details (Top/Bottom)**: 自动缩放至关键弯道，清晰查看红线（最小曲率）如何通过 Formula 24 的精确限制贴合弯心。
+3. **Alpha Distribution**: 决策变量 $\alpha$ 随索引的变化曲线。红线越靠近 0，代表赛车越贴合左侧边界。
+
+## 6. 项目结构 (Repository Structure)
+
+- `reproduce_paper.py`: 核心算法实现（含详尽中文注释）。
+- `debug_bounds.py`: 辅助调试脚本，用于计算并打印每一处 Formula 24 的原始数值。
+- `track.csv`: 示例赛道地图。
+- `trajectory_comparison.png`: 示例输出图像。
+
+---
+
+**Author**: art3m1s-tju  
+**License**: MIT
