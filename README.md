@@ -2,80 +2,84 @@
 
 ## 1. 项目简介 (Overview)
 
-本项目是对顶级赛车轨迹规划算法《Global minimum time trajectory planning considering curvature and distance for track racing》的深度 Python 复现。
+本项目是对顶级赛车轨迹规划算法《Global minimum time trajectory planning considering curvature and distance for track racing》的深度 Python 复现。本项目不仅实现了论文所述的算法，还针对原论文中存在的**三处核心数学公式错误**进行了修正，并采用 **OSQP** 求解器实现了高效的序列二次规划 (SQP) 迭代。
 
-核心采用 **序列二次规划 (Sequential Quadratic Programming, SQP)** 框架，结合 **OSQP (Operator Splitting Quadratic Program)** 这一现代、高效的稀疏二次规划求解器，实现了针对大规模赛道地图（3000+ 控制点）的秒级最优轨迹生成。
+## 2. 核心数学修正与复现细节 (Mathematical Corrections)
 
-## 2. 核心数学原理 (Mathematical Foundations)
+在复现过程中，我们通过量纲分析和严密的数学推导，发现了原论文中三处导致程序无法正常运行或逻辑错误的笔误。以下是详细的对比与修正说明：
 
-本项目不仅实现了基本的样条曲率优化，还完整还原了论文中复杂的物理占用约束。
+### 2.1 目标函数梯度项修正 (Formula 21.2)
 
-### 2.1 目标函数构成 (Cost Function)
-优化目标由两部分组成：
-$$J = J_k + \epsilon J_s$$
-- **$J_k$ (Curvature Factor)**: 最小化路径曲率。通过三次样条 (Cubic Splines) 近似二阶导数矩阵 $M$，从而将曲率惩罚转化为关于决策变量 $\alpha$ 的二次型 $1/2 \alpha^T H_k \alpha + f_k^T \alpha$。
-- **$J_s$ (Distance Factor)**: 最小化行驶路程。通过一阶差分矩阵 $A$ 计算相邻点间距离。
-- **$\epsilon$ (Weight)**: 平衡因子。$\epsilon=0$ 为极致切弯（最小曲率线），$\epsilon > 1000$ 为极致路程节省（几何中心线）。
+**原论文问题**：
+在计算曲率因子的线性项 $f_\kappa$ 时，原文给出的公式（见式 21.2）将所有的矩阵乘法项都应用在了参考点 $p$ 上。
+$$f_{\kappa} = 2(B^{-1}Cp_x)^T T_{xx} (B^{-1}Cp_x) + \dots$$
+**修正逻辑**：
+根据目标函数 $E = \|M(p + V\alpha)\|_T^2$ 对变量 $\alpha$ 求偏导的链式法则，线性项梯度必须保留方向矩阵 $V$。
+- **错误点**：如果全用 $p$，结果将是一个**标量**而非**向量**，导致优化器无法获得每个点的梯度方向。
+- **项目修正**：在代码中我们将左侧项替换为方向向量 $V^T$，确保 $f_\kappa$ 是一个 $N \times 1$ 的梯度向量。
 
-### 2.2 物理占用约束与公式纠错 (Exact Physical Constraints)
+### 2.2 有效车宽投影修正 (Formula 23)
 
-本实现严格执行了论文第 3.6 和 3.7 节的复杂几何约束：
+**原论文问题**：
+论文在计算动态车宽 $w_v$ 时，公式内部出现了**纯数值与弧度相减**的单位错误：
+$$w_v = \frac{\sqrt{l_v^2+b_v^2}}{2} \cos\left( \frac{v_i \cdot d_i}{|v_i||d_i|} - \arctan\frac{b_v}{l_v} \right)$$
+**修正逻辑**：
+- **错误点**：$\frac{v_i \cdot d_i}{|v_i||d_i|}$ 得到的是两个向量夹角的**余弦值**（范围 $[-1, 1]$），而 $\arctan\frac{b_v}{l_v}$ 是一个**角度值**。物理上无法直接相减。
+- **项目修正**：我们在代码中为前项添加了 `arccos` 函数，将其转换为角度后进行运算：
+$$w_v = \frac{\sqrt{l_v^2+b_v^2}}{2} \cos\left( \arccos\left(\frac{v_i \cdot d_i}{|v_i||d_i|}\right) - \arctan\frac{b_v}{l_v} \right)$$
 
-#### 2.2.1 动态有效车宽 (Formula 23)
-考虑车辆在弯道中的侧向投影，有效宽度 $w_v$ 为：
-$$w_v = \frac{\sqrt{l_v^2 + b_v^2}}{2} |\cos(\theta_{vd} - \theta_{veh})|$$
-代码通过实时的轨迹切线斜率动态计算 `angle_vehicle`，从而确保在每一个迭代步，车身占用的赛道面积都是精确计算的。
+### 2.3 边界决策变量 $\alpha$ 约束修正 (Formula 24)
 
-#### 2.2.2 投影约束边界 (Formula 24)
-为了将三维车辆约束投影到二维 $\alpha$ 比例系数上，我们通过计算边界法向量 $n_I, n_O$：
-$$\frac{w_v + w_s}{n_{Ii} \cdot v_i} \le a_i \le 1 - \frac{w_v + w_s}{n_{Oi} \cdot v_i}$$
+**原论文问题**：
+这是原论文中最致命的**量纲（物理单位）错误**。原文给出的 $\alpha$ 边界为：
+$$\frac{(w_v + w_s)|v_i|}{n_{Ii} \cdot v_i} \le \alpha_i \le 1 - \dots$$
+**修正逻辑**：
+- **定义检查**：根据论文定义，$r_i = p_i + \alpha_i v_i$，其中 $\alpha_i$ 是一个 $[0, 1]$ 之间的**无量纲比例系数**。
+- **错误点**：原公式分子 $(w_v + w_s)|v_i|$ 的单位是 $meters^2$，分母 $n \cdot v$ 单位是 $meters$，结果单位是 $meters$。要求一个百分比 $\alpha$ 大于一个长度（如 2.5 米）在数学上是不成立的，这会导致优化结果始终被强制锁死。
+- **项目修正**：移除多余的 $|v_i|$，使约束回归无量纲形式：
+$$\alpha_{min} = \frac{w_v + w_s}{n_{Ii} \cdot v_i}$$
 
-> [!IMPORTANT]
-> **公式修正说明**：原论文公式 (24) 分子中包含 $|v_i|$ 乘子。在复现过程中我们通过量纲分析证实这是一个**印刷错误**。按原公式会导致 $\alpha$ 约束远超 0-1 范围，导致车辆被死锁在中心。本项目已移除该错误乘子，完美恢复了“外-内-外”走线。
-
-### 2.3 SQP 稳定性优化 (Damping)
-为了解决非线性耦合带来的迭代振荡，我们在每轮迭代引入了松弛因子 $\gamma = 0.5$：
-$$\alpha_{ref}^{(k+1)} = (1-\gamma)\alpha_{ref}^{(k)} + \gamma\alpha_{new}$$
+---
 
 ## 3. 环境准备 (Installation)
 
-本项目依赖经典的科学计算栈 python 3.8+：
+本项目运行在 Python 环境下，推荐使用 Python 3.8+。
 
 ```bash
-# 克隆仓库
+# 1. 克隆项目
 git clone https://github.com/art3m1s-tju/Curvature-Distance-Trajectory-SQP.git
 cd Curvature-Distance-Trajectory-SQP
 
-# 安装依赖
+# 2. 安装科学计算依赖
 pip install numpy pandas scipy matplotlib osqp
 ```
 
-## 4. 运行指南 (Getting Started)
+## 4. 运行指南 (Usage)
 
-### 4.1 快速运行
-直接执行主脚本，它会自动加载 `track.csv` 并分别计算两种权重下的轨迹：
+### 4.1 脚本执行
+直接运行主脚本，程序将加载 `track.csv` 数据并执行 50 轮 SQP 迭代。
 ```bash
 python reproduce_paper.py
 ```
 
-### 4.2 数据格式说明
-如果是使用自定义赛道，请确保 `track.csv` 包含以下列：
-- `left_border_x`, `left_border_y`: 内边界坐标
-- `right_border_x`, `right_border_y`: 外边界坐标
+### 4.2 输出结果说明
+- **控制台输出**：将实时打印每一轮迭代的收敛状态（$\alpha$ 的最大变化量）。
+- **图片结果**：运行结束后将在当前目录下生成 `trajectory_comparison.png`。该图包含：
+  - **Full Track Overview**：展示整体赛道与两条轨迹。
+  - **Corner Detail**：放大弯道细节，观察 Formula 24 修正后的精准切弯。
+  - **Alpha Distribution**：决策变量的分布直方图。
 
-## 5. 结果可视化 (Visualization)
+### 4.3 核心参数调节
+在 `reproduce_paper.py` 的 `__main__` 部分可以调节以下关键参数：
+- `epsilon`: 平衡权重。设为 0 时为纯最小曲率线；增大（如 1000）则倾向于最短路径。
+- `ws`: 安全冗余距离（米）。增加此值会让轨迹离墙更远。
+- `gamma`: SQP 松弛因子。默认 0.5，若发现不收敛可以适当调小（如 0.2）。
 
-运行后将生成高清大图 `trajectory_comparison.png`，包含四个子板块：
-1. **Full Track Overview**: 全赛道宏观走线对比。
-2. **Corner Details (Top/Bottom)**: 自动缩放至关键弯道，清晰查看红线（最小曲率）如何通过 Formula 24 的精确限制贴合弯心。
-3. **Alpha Distribution**: 决策变量 $\alpha$ 随索引的变化曲线。红线越靠近 0，代表赛车越贴合左侧边界。
+## 5. 项目结构 (Structure)
 
-## 6. 项目结构 (Repository Structure)
-
-- `reproduce_paper.py`: 核心算法实现（含详尽中文注释）。
-- `debug_bounds.py`: 辅助调试脚本，用于计算并打印每一处 Formula 24 的原始数值。
-- `track.csv`: 示例赛道地图。
-- `trajectory_comparison.png`: 示例输出图像。
+- `reproduce_paper.py`: 核心复现逻辑。
+- `track.csv`: 赛道数据（包含左、右边界点坐标）。
+- `trajectory_comparison.png`: 示例运行结果截图。
 
 ---
 
