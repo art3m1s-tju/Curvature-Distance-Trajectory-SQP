@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import osqp
 import matplotlib.pyplot as plt
+import scipy.linalg as la
 
 def load_track_data(filepath='track.csv'):
     """
@@ -88,27 +90,36 @@ def calculate_derivative_matrices(r):
     # 提取参考轨迹坐标的 y 分量
     ry = r[:, 1]
     
-    # 计算相邻点在 x 方向的差值，并使用 numpy.roll 实现前向闭环位移 (模拟 r_{i+1} - r_i)
-    rx_prime = np.roll(rx, -1) - rx
-    # 计算相邻点在 y 方向的差值，并使用 numpy.roll 实现前向闭环位移 (模拟 r_{i+1} - r_i)
-    ry_prime = np.roll(ry, -1) - ry
-    # 根据勾股定理计算相邻点之间的直线距离 ds (可以近似为弧长 differential s)
+    # 计算相邻点在 x 方向的一阶导数，求的是平均每一个格子 x 值的变化量 (中心差分, (r_{i+1} - r_{i-1}) / 2)
+    rx_prime = (np.roll(rx, -1) - np.roll(rx, 1)) / 2.0
+    # 计算相邻点在 y 方向的一阶导数，求的是平均每一个格子 y 值的变化量 (中心差分)
+    ry_prime = (np.roll(ry, -1) - np.roll(ry, 1)) / 2.0
+    # 根据勾股定理计算相邻点之间的直线距离 ds，代表一个单位步长下对应的单位弧长 (可以近似为弧长 differential s)
     ds = np.sqrt(rx_prime**2 + ry_prime**2)
     
     # 避免除以 0 的情况，将 x 方向一阶导数归一化为关于弧长的导数 (dx/ds)
-    rx_prime = rx_prime / (ds + 1e-6)
+    # 除以 ds 求的是沿着轨迹每往前走一米 x 和 y 坐标的变化量
+    # + 1e-8 的原因是避免分母为 0
+    rx_prime = rx_prime / (ds + 1e-8)
     # 避免除以 0 的情况，将 y 方向一阶导数归一化为关于弧长的导数 (dy/ds)
-    ry_prime = ry_prime / (ds + 1e-6)
+    ry_prime = ry_prime / (ds + 1e-8)
     
-    # 计算论文公式 (10) 中 T矩阵共同的分母部分项 ((x')^2 + (y')^2)^{3/2}
-    denominator = (rx_prime**2 + ry_prime**2)**1.5 + 1e-8
+    # 按照图片中的公式 (12.1), (12.2), (12.3):
+    # 分母应该是 (x_i'^2 + y_i'^2)^3
+    # 在代码中，因为 rx_prime 和 ry_prime 本来就是差分 (且在这个部分重新计算且没有事先除以 ds)，
+    # 我们可以重新计算未归一化的导数，或者直接按照之前算好的未归一化导数计算。
     
-    # 计算公式(10)中权重矩阵 Txx 的对角线元素
-    Txx_diag = (ry_prime**2) / denominator
-    # 计算公式(10)中权重矩阵 Tyy 的对角线元素
-    Tyy_diag = (rx_prime**2) / denominator
-    # 计算公式(10)中权重矩阵 Txy 的对角线元素
-    Txy_diag = -(rx_prime * ry_prime) / denominator
+    # 重新获取未归一化的导数
+    rx_prime_unnorm = (np.roll(rx, -1) - np.roll(rx, 1)) / 2.0
+    ry_prime_unnorm = (np.roll(ry, -1) - np.roll(ry, 1)) / 2.0
+    
+    # 分母: (x'^2 + y'^2)^3
+    denominator = (rx_prime_unnorm**2 + ry_prime_unnorm**2)**3 + 1e-8
+    
+    # 根据公式计算对角线元素
+    Txx_diag = (ry_prime_unnorm**2) / denominator
+    Tyy_diag = (rx_prime_unnorm**2) / denominator
+    Txy_diag = (-2 * rx_prime_unnorm * ry_prime_unnorm) / denominator
     
     # 将 Txx_diag 主对角线元素转换生成为 N x N 维度稀疏对角矩阵 Txx
     Txx = sp.diags(Txx_diag)
@@ -117,18 +128,35 @@ def calculate_derivative_matrices(r):
     # 将 Txy_diag 主对角线元素转换生成为 N x N 维度稀疏对角矩阵 Txy
     Txy = sp.diags(Txy_diag)
     
-    # 构建拉普拉斯算子形(中心差分)的二阶导数矩阵 M 用于代替论文中复杂的三次样条 C 和 B 矩阵。
-    # 设置常系数 1, -2, 1 在主对角线和上下副对角线处。
-    M = sp.diags([1, -2, 1], [-1, 0, 1], shape=(N, N)).tolil()
-    # 为了实现赛道首尾完美闭合，修改首行末列对应连接节点为 1
-    M[0, N-1] = 1
-    # 为了实现赛道首尾完美闭合，修改末行首列对应连接节点为 1
-    M[N-1, 0] = 1
+    # 严格按照论文图片（19）中的固定常数形式构建 B 和 C 矩阵
+    # 这是因为论文假设了参考点按“索引 t”构成了均匀参数化 (即 Delta t 恒等于 1)
+    # 这使得原本基于复杂不均匀分布 ds 的样条常系数全部退化为了这组整数。
     
-    # 将前面构建的单位弧长 M 矩阵除以实际物理弧长平方 (ds^2)，转换为真正的关于 s 二阶导数运算矩阵，这部分对应公式 (13) 和 (16.2), (17) 三次样条约束的近似结果
-    ds_diag = sp.diags(1.0 / (ds**2 + 1e-6))
-    # 完成对角弧长平方矩阵与差分 M 矩阵的结合计算，并将结果转换成 CSC 格式返回
-    M = ds_diag @ M.tocsc()
+    # 构造 B 矩阵的对角线元素
+    B = sp.diags([1, 4, 1], [-1, 0, 1], shape=(N, N)).tolil()
+    
+    # 构造 C 矩阵的对角线元素
+    C = sp.diags([6, -12, 6], [-1, 0, 1], shape=(N, N)).tolil()
+    
+    # 处理赛道闭环边界条件
+    B[0, N-1] = 1
+    B[N-1, 0] = 1
+    
+    C[0, N-1] = 6
+    C[N-1, 0] = 6
+    
+    # 采用密集矩阵求逆以提升大矩阵乘法效率并转回稀疏传入
+    # 理论推导公式中，二阶导数矩阵 M 的满足 B * (M r) = C r
+    # 所以二阶导数算子 M = B^{-1} * C
+    C_dense = C.toarray()
+    B_dense = B.toarray()
+
+    B_inv = la.inv(B_dense)
+    M_dense = B_inv @ C_dense
+    
+    # 截断极小值以恢复矩阵的带状稀疏性，如果不截断，随着 B^-1 变致密，Hk 也会成密集矩阵，OSQP 的稀疏 LDL 分解将耗时极大崩溃
+    M_dense[np.abs(M_dense) < 1e-4] = 0.0
+    M = sp.csc_matrix(M_dense)
     
     # 将四个生成的曲率核心矩阵抛回给主程序使用
     return Txx, Tyy, Txy, M
@@ -155,34 +183,115 @@ def calculate_curvature_factor(M, Txx, Tyy, Txy, p, v):
     # 预计算交叉项的曲率代价关联矩阵 M^T * Txy * M
     MT_Txy_M = M.T @ Txy @ M
     
-    # Hessian 计算 (对应公式 20 中矩阵 H_k 的各组成部分)
-    # 计算曲率矩阵第一主成分项(x与x作用项): Vx^T * (M^T Txx M) * Vx
+    # 严格按照论文公式 (21.1) 重构 Hk
+    # 第一项 (x分量): (B^-1 C v_x)^T T_xx (B^-1 C v_x)
     term1 = Vx.T @ MT_Txx_M @ Vx
-    # 计算曲率矩阵第二主成分项(y与y作用项): Vy^T * (M^T Tyy M) * Vy
+    # 第二项 (交叉项): (B^-1 C v_x)^T T_xy (B^-1 C v_y)
+    term_cross = Vx.T @ MT_Txy_M @ Vy
+    # 第三项 (y分量): (B^-1 C v_y)^T T_yy (B^-1 C v_y)
     term2 = Vy.T @ MT_Tyy_M @ Vy
-    # 计算曲率矩阵交叉成分项1(x与y作用项): Vx^T * (M^T Txy M) * Vy
-    term3 = Vx.T @ MT_Txy_M @ Vy
-    # 计算曲率矩阵交叉成分项2(y与x作用项): Vy^T * (M^T Txy M) * Vx，由对称性此与上一步实质相似
-    term4 = Vy.T @ MT_Txy_M @ Vx
-    # 合并所有的曲率矩阵平方项，并按二次规划二次型要求乘以常数倍因子 2 形成最终的曲率 Hessian 矩阵
-    Hk = 2 * (term1 + term2 + term3 + term4)
     
-    # First-order term 计算 (对应公式 20 中向量 f_k 的各维组成)
-    # 计算曲率公式关于 x 对一次边界位置的导数对应的一次项 fk1
+    # 合并构成公式 21.1 的 Hk
+    Hk = 2 * (term1 + term_cross + term2)
+    
+    # 论文公式 (21.2) 存在笔误：原文把所有项都写成了 p（参考点坐标），但正确推导应包含 v（法向量）。
+    # 原因：曲率代价 E = (Mp + MV·α)^T T (Mp + MV·α) 对 α 求偏导后，
+    # 一次项梯度 ∂E/∂α = 2·(MV)^T·T·(Mp)，其中必须出现 V 才能让结果是 N×1 向量。
+    # 若按论文原文全用 p，则 p^T·(N×N)·p 得到的是一个标量,
+    # 虽然 NumPy 广播不会报错，但会丢失每个点独立的梯度方向信息，导致优化结果退化。
+    # 第一项: 2 * (B^-1 C v_x)^T T_xx (B^-1 C p_x)
     fk1 = Vx.T @ MT_Txx_M @ px
-    # 计算曲率公式关于 y 交叉坐标作用产生的一次项 fk2
+    # 第二项 (交叉): 2 * (B^-1 C v_y)^T T_xy (B^-1 C p_x)
+    fk_cross = Vy.T @ MT_Txy_M @ px
+    # 第三项: 2 * (B^-1 C v_y)^T T_yy (B^-1 C p_y)
     fk2 = Vy.T @ MT_Tyy_M @ py
-    # 计算由 Txy 相乘引入的对于 x 操作受 y 边界位置影响产生的一次项 fk3
-    fk3 = Vx.T @ MT_Txy_M @ py
-    # 计算由 Txy 相乘引入的对于 y 操作受 x 边界位置影响产生的一次项 fk4
-    fk4 = Vy.T @ MT_Txy_M @ px
-    # 合并上述分别计算的一次项向量元素并乘2构成完整的一次目标向量 fk
-    fk = 2 * (fk1 + fk2 + fk3 + fk4)
     
-    # 将构作好的二阶信息矩阵与一阶信息向量向外部函数返回
+    # 合并构成正确的 fk（N×1 向量）
+    fk = 2 * (fk1 + fk_cross + fk2)
+    
     return Hk, fk
 
-def optimize_trajectory(p, v, wv, ws, epsilon=0, max_iter=6):
+def calculate_boundary_normals(bound_pts, v):
+    """
+    计算边界点集的单位法向量 (对应论文图5中的 n_{Ii} 和 n_{Oi})
+    
+    根据论文图5，无论是内边界还是外边界的法向量，都应当"指向赛道内部"。
+    这意味着它与从内边界指向外边界的横向向量 v_i 总是呈现大致同向或锐角的夹角。
+    数学上，只需要保证法向量与 v_i 的点积为正 (n·v > 0) 即可实现"指向赛道内部"。
+    
+    参数:
+    - bound_pts: 边界点坐标集合 N x 2
+    - v: 从内边界点横向指向外边界点的向量 N x 2
+    
+    返回:
+    - normals: 符合物理意义的赛道向内单位法向量 N x 2
+    """
+    # 1. 使用中心差分计算边界曲线的单位切向量 tangent
+    # 中心差分求导
+    dp = (np.roll(bound_pts, -1, axis=0) - np.roll(bound_pts, 1, axis=0)) / 2.0
+    # 计算向量长度，keepdims会保持二维矩阵的形状(N,1)，方便后续广播运算
+    dp_norm = np.linalg.norm(dp, axis=1, keepdims=True)
+    # 计算单位切向量
+    tangent = dp / (dp_norm + 1e-8)
+    
+    # 2. 从切向量派生出两个互相方向相反的候选法向量
+    # 候选法向量1：逆时针旋转 90 度
+    n1 = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    # 候选法向量2：顺时针旋转 90 度
+    n2 = np.column_stack([tangent[:, 1], -tangent[:, 0]])
+    
+    # 3. 选择与跨越向量 v 点积为正的那一个方向，确保它总是指向赛道内侧
+    dot1 = np.sum(n1 * v, axis=1)
+    
+    normals = np.where(dot1[:, np.newaxis] > 0, n1, n2)
+    return normals
+
+def calculate_wv_per_point(r, v, l_v, b_v):
+    """
+    根据论文公式 (23) 计算每个离散点所需的车辆实体有效半宽 w_v。
+    
+    w_v 表示的是：将车辆（长方形 l_v * b_v）置于当前轨迹点 r_i 上并指向航向角时，
+    车辆占据在横向向量 v_i (跨越赛道方向)上的最大宽度投影。
+    简而言之：此时此刻要想不让车角蹭到边界，当前车心必须至少离边界多远。
+    
+    参数:
+    - r: 当前参考轨迹点的坐标 [N, 2]
+    - v: 内部边界指向外部边界的横向向量 [N, 2]
+    - l_v: 车辆物理总长度 (如 4.7m)
+    - b_v: 车辆物理总宽度 (如 2.0m)
+    """
+    # d_i 表示当前轨迹上车辆的实际运动航向向量 (d_i = r_{i+1} - r_i)
+    d = np.roll(r, -1, axis=0) - r
+    d_norm = np.linalg.norm(d, axis=1)
+    v_norm = np.linalg.norm(v, axis=1)
+    
+    # 避免因两点重合而除以 0 导致报错
+    d_norm_safe = np.where(d_norm < 1e-8, 1e-8, d_norm)
+    v_norm_safe = np.where(v_norm < 1e-8, 1e-8, v_norm)
+    
+    # 求解赛道横截向量 v_i 与当前行驶航向 d_i 之间的夹角 (v_i · d_i)
+    dot_vd = np.sum(v * d, axis=1)
+    # 根据点积公式 cos(theta) = (v·d) / (|v|*|d|)
+    cos_val = dot_vd / (v_norm_safe * d_norm_safe)
+    # 截断由于浮点数精度误差造成的边界溢出（如 1.00000001），防止 arccos 出现 nan
+    cos_val = np.clip(cos_val, -1.0, 1.0)
+    
+    # 求解真实的航向夹角差
+    # 论文原文在公式(23)中直接写了 cos( (v_i·d_i)/(|v_i||d_i|) - arctan(...) )，
+    # 这是一个数学笔误，余弦值不能与角度相减。我们增加 arccos 将其还原为真正的角度。
+    angle_vd = np.arccos(cos_val)
+    # 车辆的长宽构成的自身外角大小 (即车辆对角线与中心轴的夹角)
+    angle_vehicle = np.arctan2(b_v, l_v)
+    
+    # 论文公式 (23)： w_v = (sqrt(l_v^2 + b_v^2) / 2) * |cos(θ_vd - θ_veh)|
+    # 计算车辆中心到其对角（最外扩点）的直线对角长度
+    diagonal = np.sqrt(l_v**2 + b_v**2) / 2.0
+    # 将此长度投影至垂直于赛道边界横向的方向上
+    wv = diagonal * np.abs(np.cos(angle_vd - angle_vehicle))
+    
+    return wv
+
+def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
     """
     使用 OSQP 进行 SQP 序列二次规划迭代，求解最优轨迹 $\alpha$。
     """
@@ -191,24 +300,28 @@ def optimize_trajectory(p, v, wv, ws, epsilon=0, max_iter=6):
     # 调用内置辅助函数生成一个 N * N 的闭环有限前向差分网络矩阵 A_diff
     A_diff = build_difference_matrix(N)
     
-    # 直接在循环外求解距离目标，因为其系数矩阵是常数且不论迭代如何改变，它仅受几何形状控制
+    # 直接在循环外求解距离目标，因为其系数矩阵是常数且不论迭代如何改变，没受几何形状控制
     Hs, fs = calculate_distance_factor(A_diff, p, v)
     
     # 初始化最优推断轨迹。我们这里假设赛车最初打算沿着整条赛道的绝对中心（即 0.5 宽）行驶。
     alpha_ref = np.ones(N) * 0.5
     
-    # 对每一点计算路面总有效地理垂直宽度（向量 v 的二范数长度）
-    road_widths = np.linalg.norm(v, axis=1)
+    # === 边界预处理 ===
+    # v_norm: |v_i|
+    # n_I: n_{Ii} 内边界向内法向量
+    # n_O: n_{Oi} 外边界向内法向量 (q = p + v 为外边界坐标)
+    v_norm = np.linalg.norm(v, axis=1)
+    q_bound = p + v
+    n_I = calculate_boundary_normals(p, v)
+    n_O = calculate_boundary_normals(q_bound, v)
     
-    # 使用计算物理车身宽度占用(wv)与希望的安全冗余间隔(ws)，推算出车体不该触犯边界的最小合法 \alpha 参数阈值
-    alpha_min = (wv + ws) / road_widths
-    # 推算出另一侧最接近外部边界的合法最大 \alpha 阈值约束
-    alpha_max = 1.0 - (wv + ws) / road_widths
+    # 论文公式 (24) 分母中要求的点积投影因子 (n_{Ii} · v_i) 和 (n_{Oi} · v_i)
+    v_dot_nI = np.sum(n_I * v, axis=1)
+    v_dot_nO = np.sum(n_O * v, axis=1)
     
-    # 这里加两行保护代码确保就算存在异常极窄路段规划域也不为负，\alpha_min 被限制在不离内边太离谱 (0.05到0.45之间)
-    alpha_min = np.clip(alpha_min, 0.05, 0.45)
-    # \alpha_max 被强制拉回到不比0.55小且不超0.95，给数值优化留足可行域
-    alpha_max = np.clip(alpha_max, 0.55, 0.95)
+    # 防止分母处于奇异导致的除零报错
+    v_dot_nI = np.maximum(v_dot_nI, 1e-4)
+    v_dot_nO = np.maximum(v_dot_nO, 1e-4)
     
     # 由于求解器OSQP需要不等式边界阵对应所有的决策变量，我们的全变量约束就是标准单位对角稀疏矩阵（即每个 \alpha 限制自己）
     A_constr = sp.eye(N).tocsc()
@@ -221,11 +334,45 @@ def optimize_trajectory(p, v, wv, ws, epsilon=0, max_iter=6):
         # 基于从上一轮求得出的（或者第一轮设定的中心点 0.5）\alpha 权重还原出当前真实的几何坐标参照线
         r_current = p + v * alpha_ref[:, np.newaxis]
         
+        # 基于本轮得到的当前迭代轨道中心线，计算车辆走这条线时在各点霸占的车身实体投影宽度 w_v
+        # 这是动态的，因为一旦车在这拐弯的角度发生了改变，车身在横向截面上的所需面积也会随之改变
+        wv_array = calculate_wv_per_point(r_current, v, l_v, b_v)
+        
+        # 严格按论文公式 (24) 计算每个决策点可以自由规划的上下界域
+        # 注意：这里我们修正了原论文公式 (24) 中的一个严重数学笔误！
+        # 原论文写的是 (w_v + w_{s,i}) * |v_i| / (n_I · v_i)。
+        # 但 n_I · v_i 的本身量纲就是长度，分子如果再乘 |v_i| 会导致整体量纲变为长度，
+        # 而 alpha_i 是一个无量纲的比例因子 (0~1)。乘上 |v_i| 会直接导致算出的上下界大于 1 甚至大于 2。
+        # 上下界全部失效后，受后面的 clip 保护，车辆被死死锁在 0.45~0.55 的赛道绝对中心。
+        # 正确的区别是将多余的 v_norm 乘子去掉：
+        alpha_min = (wv_array + ws) / v_dot_nI
+        
+        # 右侧不等式（上界）：要求向左靠时同样不能蹭墙
+        alpha_max = 1.0 - (wv_array + ws) / v_dot_nO
+        
+        # 防止规划解死锁或出界：这里给它一个硬性安全范围（最少离内测框一点容错域，也不冲着超出界外跑）
+        alpha_min = np.clip(alpha_min, 0.05, 0.45)
+        alpha_max = np.clip(alpha_max, 0.55, 0.95)
+        
         # 将刚刚还原的最参考坐标系送进去算出其相较于世界系各导数权重并以此产生下一次曲率运算所必须利用常数列
         Txx, Tyy, Txy, M = calculate_derivative_matrices(r_current)
         # 用前一步的临时系数 T 系列等结果结合赛道地形建立当次步进真正所需的关于 \alpha 决策变量的 Hk 矩阵
         Hk, fk = calculate_curvature_factor(M, Txx, Tyy, Txy, p, v)
         
+        # 检查矩阵正定性，如果 Hk 有负特征值则修补
+        Hk_dense = Hk.toarray()
+        eigvals = np.linalg.eigvalsh(Hk_dense)
+        min_eig = np.min(eigvals)
+        if min_eig < 0:
+            Hk = Hk + sp.diags(np.ones(N) * (-min_eig + 1e-4))
+
+        # 同样检查 Hs
+        if iteration == 0:
+            Hs_dense = Hs.toarray()
+            min_eig_s = np.min(np.linalg.eigvalsh(Hs_dense))
+            if min_eig_s < 0:
+                Hs = Hs + sp.diags(np.ones(N) * (-min_eig_s + 1e-4))
+
         # 按照论文思想利用权重 \epsilon 把刚得出的带非线性假设的曲率 Hk阵 和 一直不变的距离常数 Hs 阵直接线形求和合并为一个唯一的二次惩罚结构 P 并注入微量的抗奇异稳定因子
         P = sp.csc_matrix(Hk + epsilon * Hs + reg)
         # 一次项直接作对应目标合并，构造全局线性衰减因子 q
@@ -254,8 +401,13 @@ def optimize_trajectory(p, v, wv, ws, epsilon=0, max_iter=6):
         # 于命令行记录本次迭代后发生的赛车轨迹线侧移收敛情况
         print(f"迭代 {iteration+1}/{max_iter} 完毕，最大 alpha 变化量: {diff:.6f}")
         
-        # 通过验证本轮推演，我们强制将作为求解目标的原始估猜替换为您刚才找到更优秀的这一组合让其步入下个分析轮回
-        alpha_ref = alpha_new
+        # SQP 松弛步长控制（Relaxation / Damping）
+        # 如果直接采用 alpha_ref = alpha_new，纯曲率优化 (epsilon=0) 时优化器每轮会激进地
+        # 将 alpha 推到边界极值，下一轮重新线性化后又回弹，导致严重振荡无法收敛。
+        # 引入松弛因子 gamma ∈ (0, 1]，每轮只走部分步长：
+        #   alpha_ref = (1 - gamma) * alpha_old + gamma * alpha_new
+        gamma = 0.5
+        alpha_ref = (1 - gamma) * alpha_ref + gamma * alpha_new
         
         # 倘若检测最大决策变量值相对前一次修改没能跳出极小误差区间容忍，判定曲线算法大体稳定抵达最速，主动结束。
         if diff < 1e-3:
@@ -269,36 +421,88 @@ def optimize_trajectory(p, v, wv, ws, epsilon=0, max_iter=6):
 
 if __name__ == '__main__':
     # 1. 车辆与安全边界参数
-    wv = 1.0  
-    ws = 0.5  
+    l_v = 4.7  # 车辆长度
+    b_v = 2.0  # 车辆宽度
+    ws = 0.5   # 额外安全距离
     
     print("加载并解析轨迹数据...")
     p, q_bound, v = load_track_data('track.csv')
     
     # 2. 计算纯最小曲率轨迹 (epsilon = 0)
     print("\n--- 计算最小曲率轨迹 (epsilon = 0) ---")
-    r_opt_k, alpha_k = optimize_trajectory(p, v, wv, ws, epsilon=0.0, max_iter=5)
+    r_opt_k, alpha_k = optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0.0, max_iter=50)
     
-    # 3. 计算平衡轨迹 (epsilon = 10)
-    print("\n--- 计算平衡轨迹 (epsilon = 10.0) ---")
-    r_opt_s, alpha_s = optimize_trajectory(p, v, wv, ws, epsilon=10.0, max_iter=5)
+    # 3. 计算平衡轨迹 (epsilon = 1000.0)
+    print("\n--- 计算平衡轨迹 (epsilon = 1000.0) ---")
+    r_opt_s, alpha_s = optimize_trajectory(p, v, l_v, b_v, ws, epsilon=1000.0, max_iter=50)
 
     # 4. 绘图
-    plt.figure(figsize=(10, 8))
-    idx_start = 0
-    idx_end = 800
+    # --- 主图：全赛道概览 + 弯道放大 + alpha 分布 ---
+    fig, axes = plt.subplots(2, 2, figsize=(24, 20))
     
-    plt.plot(p[:, 0][idx_start:idx_end], p[:, 1][idx_start:idx_end], 'k-', label='Inner Border')
-    plt.plot(q_bound[:, 0][idx_start:idx_end], q_bound[:, 1][idx_start:idx_end], 'k-', label='Outer Border')
+    # 闭环连线：将第一个点拼接到最后，使得画图时首尾相连
+    p_plot = np.vstack((p, p[0]))
+    q_plot = np.vstack((q_bound, q_bound[0]))
+    r_k_plot = np.vstack((r_opt_k, r_opt_k[0]))
+    r_s_plot = np.vstack((r_opt_s, r_opt_s[0]))
     
-    plt.plot(r_opt_k[:, 0][idx_start:idx_end], r_opt_k[:, 1][idx_start:idx_end], 'r--', linewidth=2, label='Min Curvature ($\epsilon$=0)')
-    plt.plot(r_opt_s[:, 0][idx_start:idx_end], r_opt_s[:, 1][idx_start:idx_end], 'b-.', linewidth=2, label='Balanced ($\epsilon$=10)')
+    # 左上: 全赛道概览
+    ax1 = axes[0, 0]
+    ax1.plot(p_plot[:, 0], p_plot[:, 1], 'k-', linewidth=1.5, label='Left border (p)')
+    ax1.plot(q_plot[:, 0], q_plot[:, 1], 'k-', linewidth=1.5, alpha=0.6, label='Right border (q)')
+    ax1.plot(r_k_plot[:, 0], r_k_plot[:, 1], 'r-', linewidth=2.5, label='Min Curvature (eps=0)')
+    ax1.plot(r_s_plot[:, 0], r_s_plot[:, 1], 'b--', linewidth=2.5, label='Balanced (eps=1000)')
+    ax1.set_title("Full Track Overview", fontsize=16)
+    ax1.set_xlabel("X (m)")
+    ax1.set_ylabel("Y (m)")
+    ax1.legend(fontsize=12)
+    ax1.set_aspect('equal')
+    ax1.grid(True, alpha=0.3)
     
-    plt.title("Trajectory Optimization Comparison")
-    plt.xlabel("X Position (m)")
-    plt.ylabel("Y Position (m)")
-    plt.legend()
-    plt.axis("equal")
-    plt.grid()
-    plt.savefig('trajectory_comparison.png')
+    # 右上: 放大弯道1 (左上角区域)
+    ax2 = axes[0, 1]
+    ax2.plot(p_plot[:, 0], p_plot[:, 1], 'k-', linewidth=1.5)
+    ax2.plot(q_plot[:, 0], q_plot[:, 1], 'k-', linewidth=1.5, alpha=0.6)
+    ax2.plot(r_k_plot[:, 0], r_k_plot[:, 1], 'r-', linewidth=3, label='Min Curvature')
+    ax2.plot(r_s_plot[:, 0], r_s_plot[:, 1], 'b--', linewidth=3, label='Balanced')
+    ax2.set_xlim(-650, -350)
+    ax2.set_ylim(100, 350)
+    ax2.set_title("Corner Detail (Top-Left)", fontsize=16)
+    ax2.legend(fontsize=12)
+    ax2.set_aspect('equal')
+    ax2.grid(True, alpha=0.3)
+    
+    # 左下: 放大弯道2 (右下角区域)
+    ax3 = axes[1, 0]
+    ax3.plot(p_plot[:, 0], p_plot[:, 1], 'k-', linewidth=1.5)
+    ax3.plot(q_plot[:, 0], q_plot[:, 1], 'k-', linewidth=1.5, alpha=0.6)
+    ax3.plot(r_k_plot[:, 0], r_k_plot[:, 1], 'r-', linewidth=3, label='Min Curvature')
+    ax3.plot(r_s_plot[:, 0], r_s_plot[:, 1], 'b--', linewidth=3, label='Balanced')
+    ax3.set_xlim(100, 600)
+    ax3.set_ylim(-500, -150)
+    ax3.set_title("Corner Detail (Bottom-Right)", fontsize=16)
+    ax3.legend(fontsize=12)
+    ax3.set_aspect('equal')
+    ax3.grid(True, alpha=0.3)
+    
+    # 右下: alpha 分布对比
+    ax4 = axes[1, 1]
+    indices = np.arange(len(alpha_k))
+    ax4.plot(indices, alpha_k, 'r-', linewidth=1.5, label='Min Curvature alpha', alpha=0.8)
+    ax4.plot(indices, alpha_s, 'b-', linewidth=1.5, label='Balanced alpha', alpha=0.8)
+    ax4.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='Track center (alpha=0.5)')
+    ax4.set_title("Alpha Distribution", fontsize=16)
+    ax4.set_xlabel("Control Point Index")
+    ax4.set_ylabel("Alpha Value")
+    ax4.legend(fontsize=12)
+    ax4.grid(True, alpha=0.3)
+    ax4.set_ylim(-0.05, 1.05)
+    
+    plt.tight_layout()
+    plt.savefig('trajectory_comparison.png', dpi=150, bbox_inches='tight')
     print("\n对比图已保存为 'trajectory_comparison.png'")
+    
+    # 打印 alpha 统计信息
+    print(f"\n最小曲率 alpha 统计: min={alpha_k.min():.4f}, max={alpha_k.max():.4f}, mean={alpha_k.mean():.4f}")
+    print(f"平衡轨迹 alpha 统计: min={alpha_s.min():.4f}, max={alpha_s.max():.4f}, mean={alpha_s.mean():.4f}")
+
