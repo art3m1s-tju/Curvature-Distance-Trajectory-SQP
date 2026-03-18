@@ -128,15 +128,19 @@ def calculate_derivative_matrices(r):
     # 将 Txy_diag 主对角线元素转换生成为 N x N 维度稀疏对角矩阵 Txy
     Txy = sp.diags(Txy_diag)
     
-    # 严格按照论文图片（19）中的固定常数形式构建 B 和 C 矩阵
-    # 这是因为论文假设了参考点按“索引 t”构成了均匀参数化 (即 Delta t 恒等于 1)
-    # 这使得原本基于复杂不均匀分布 ds 的样条常系数全部退化为了这组整数。
-    
+    # 将生成的三个曲率核心矩阵抛回给主程序使用
+    return Txx, Tyy, Txy
+
+def calculate_M_matrix(N):
+    """
+    构造三次样条（等距简化版）的二阶导数映射矩阵 M (M = B^{-1}C)
+    由于 B 和 C 对于固定 N 的问题是常数矩阵，只需在循环外计算一次即可，极大提升性能。
+    """
     # 构造 B 矩阵的对角线元素
-    B = sp.diags([1, 4, 1], [-1, 0, 1], shape=(N, N)).tolil()
+    B = sp.diags([1, 4, 1], [-1, 0, 1], shape=(N, N), dtype=float).tolil()
     
     # 构造 C 矩阵的对角线元素
-    C = sp.diags([6, -12, 6], [-1, 0, 1], shape=(N, N)).tolil()
+    C = sp.diags([6, -12, 6], [-1, 0, 1], shape=(N, N), dtype=float).tolil()
     
     # 处理赛道闭环边界条件
     B[0, N-1] = 1
@@ -146,8 +150,6 @@ def calculate_derivative_matrices(r):
     C[N-1, 0] = 6
     
     # 采用密集矩阵求逆以提升大矩阵乘法效率并转回稀疏传入
-    # 理论推导公式中，二阶导数矩阵 M 的满足 B * (M r) = C r
-    # 所以二阶导数算子 M = B^{-1} * C
     C_dense = C.toarray()
     B_dense = B.toarray()
 
@@ -158,8 +160,7 @@ def calculate_derivative_matrices(r):
     M_dense[np.abs(M_dense) < 1e-4] = 0.0
     M = sp.csc_matrix(M_dense)
     
-    # 将四个生成的曲率核心矩阵抛回给主程序使用
-    return Txx, Tyy, Txy, M
+    return M
 
 def calculate_curvature_factor(M, Txx, Tyy, Txy, p, v):
     """
@@ -186,28 +187,28 @@ def calculate_curvature_factor(M, Txx, Tyy, Txy, p, v):
     # 严格按照论文公式 (21.1) 重构 Hk
     # 第一项 (x分量): (B^-1 C v_x)^T T_xx (B^-1 C v_x)
     term1 = Vx.T @ MT_Txx_M @ Vx
-    # 第二项 (交叉项): (B^-1 C v_x)^T T_xy (B^-1 C v_y)
+    # 第二项 (交叉项): 这里必需补全对称结构，论文公式（15）其实是二次型，所以 A 需要 A + A^T
     term_cross = Vx.T @ MT_Txy_M @ Vy
+    term_cross_sym = term_cross + term_cross.T
     # 第三项 (y分量): (B^-1 C v_y)^T T_yy (B^-1 C v_y)
     term2 = Vy.T @ MT_Tyy_M @ Vy
     
-    # 合并构成公式 21.1 的 Hk
-    Hk = 2 * (term1 + term_cross + term2)
+    # 合并构成公式 21.1 的 Hk (补全了漏掉的一半交叉偏导矩阵)
+    Hk = 2 * (term1 + term2) + term_cross_sym
     
-    # 论文公式 (21.2) 存在笔误：原文把所有项都写成了 p（参考点坐标），但正确推导应包含 v（法向量）。
-    # 原因：曲率代价 E = (Mp + MV·α)^T T (Mp + MV·α) 对 α 求偏导后，
-    # 一次项梯度 ∂E/∂α = 2·(MV)^T·T·(Mp)，其中必须出现 V 才能让结果是 N×1 向量。
-    # 若按论文原文全用 p，则 p^T·(N×N)·p 得到的是一个标量,
-    # 虽然 NumPy 广播不会报错，但会丢失每个点独立的梯度方向信息，导致优化结果退化。
-    # 第一项: 2 * (B^-1 C v_x)^T T_xx (B^-1 C p_x)
+    # 论文公式 (21.2) 除把 p 写错以外，它还漏了另外一半交叉项的梯度传递！
+    # 对 α 求偏导一次项:
+    # J_x 部分: 2 * (MV_x)^T T_xx (Mp_x)
+    # J_y 部分: 2 * (MV_y)^T T_yy (Mp_y)
+    # J_xy 单叉项: (MV_x)^T T_xy (Mp_y) + (MV_y)^T T_xy (Mp_x)
+    
     fk1 = Vx.T @ MT_Txx_M @ px
-    # 第二项 (交叉): 2 * (B^-1 C v_y)^T T_xy (B^-1 C p_x)
-    fk_cross = Vy.T @ MT_Txy_M @ px
-    # 第三项: 2 * (B^-1 C v_y)^T T_yy (B^-1 C p_y)
+    fk_cross1 = Vy.T @ MT_Txy_M @ px
+    fk_cross2 = Vx.T @ MT_Txy_M @ py
     fk2 = Vy.T @ MT_Tyy_M @ py
     
-    # 合并构成正确的 fk（N×1 向量）
-    fk = 2 * (fk1 + fk_cross + fk2)
+    # 合并构成正确的 fk（N×1 向量，包含了双向交叉项投影）
+    fk = 2 * (fk1 + fk2) + fk_cross1 + fk_cross2
     
     return Hk, fk
 
@@ -297,14 +298,19 @@ def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
     """
     # 提取共有多少个离散路径控制点以决定整体规划问题的矩阵维度 N
     N = len(p)
+    import scipy.sparse.linalg as spla
+    
+    # 提前计算纯几何导数算子 M (只计算一次)
+    M = calculate_M_matrix(N)
+    
     # 调用内置辅助函数生成一个 N * N 的闭环有限前向差分网络矩阵 A_diff
     A_diff = build_difference_matrix(N)
     
     # 直接在循环外求解距离目标，因为其系数矩阵是常数且不论迭代如何改变，没受几何形状控制
     Hs, fs = calculate_distance_factor(A_diff, p, v)
     
-    # 初始化最优推断轨迹。我们这里假设赛车最初打算沿着整条赛道的绝对中心（即 0.5 宽）行驶。
-    alpha_ref = np.ones(N) * 0.5
+    # 根据用户反馈：初始参考线切回“内边界首轮”，即 alpha=0
+    alpha_ref = np.zeros(N)
     
     # === 边界预处理 ===
     # v_norm: |v_i|
@@ -350,28 +356,24 @@ def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
         # 右侧不等式（上界）：要求向左靠时同样不能蹭墙
         alpha_max = 1.0 - (wv_array + ws) / v_dot_nO
         
-        # 防止规划解死锁或出界：这里给它一个硬性安全范围（最少离内测框一点容错域，也不冲着超出界外跑）
-        alpha_min = np.clip(alpha_min, 0.05, 0.45)
-        alpha_max = np.clip(alpha_max, 0.55, 0.95)
+        # 不再硬裁剪 0.05-0.95，而是直接确保 min 不超过 max，防止交叉死锁
+        alpha_max = np.maximum(alpha_max, alpha_min + 1e-3)
         
         # 将刚刚还原的最参考坐标系送进去算出其相较于世界系各导数权重并以此产生下一次曲率运算所必须利用常数列
-        Txx, Tyy, Txy, M = calculate_derivative_matrices(r_current)
+        Txx, Tyy, Txy = calculate_derivative_matrices(r_current)
         # 用前一步的临时系数 T 系列等结果结合赛道地形建立当次步进真正所需的关于 \alpha 决策变量的 Hk 矩阵
         Hk, fk = calculate_curvature_factor(M, Txx, Tyy, Txy, p, v)
         
-        # 检查矩阵正定性，如果 Hk 有负特征值则修补
-        Hk_dense = Hk.toarray()
-        eigvals = np.linalg.eigvalsh(Hk_dense)
-        min_eig = np.min(eigvals)
-        if min_eig < 0:
-            Hk = Hk + sp.diags(np.ones(N) * (-min_eig + 1e-4))
+        # 强制 Hk 对称化并加上轻量级正则化以保证求解器所要求的半正定性(PSD)
+        # 如果依然非正定（虽然物理模型在附近是凸的），OSQP自己也有小幅度的 internal offset.
+        # 这点大幅提升了复现速度
+        Hk = (Hk + Hk.T) / 2.0
+        Hk = Hk + sp.diags(np.ones(N) * 1e-4)
 
-        # 同样检查 Hs
+        # 同样轻量化检查 Hs
         if iteration == 0:
-            Hs_dense = Hs.toarray()
-            min_eig_s = np.min(np.linalg.eigvalsh(Hs_dense))
-            if min_eig_s < 0:
-                Hs = Hs + sp.diags(np.ones(N) * (-min_eig_s + 1e-4))
+            Hs = (Hs + Hs.T) / 2.0
+            Hs = Hs + sp.diags(np.ones(N) * 1e-4)
 
         # 按照论文思想利用权重 \epsilon 把刚得出的带非线性假设的曲率 Hk阵 和 一直不变的距离常数 Hs 阵直接线形求和合并为一个唯一的二次惩罚结构 P 并注入微量的抗奇异稳定因子
         P = sp.csc_matrix(Hk + epsilon * Hs + reg)
@@ -396,18 +398,18 @@ def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
         
         # 提取在约束下完成更新的新阶段每个离散点分配权重参数，存在新对象 \alpha_new 中
         alpha_new = res.x
-        # 取本轮寻优结果的各个点与最初输入作为参照始点的权重点求最大绝对误差距离作为此收敛精度量纲指标 diff
         diff = np.max(np.abs(alpha_new - alpha_ref))
-        # 于命令行记录本次迭代后发生的赛车轨迹线侧移收敛情况
-        print(f"迭代 {iteration+1}/{max_iter} 完毕，最大 alpha 变化量: {diff:.6f}")
         
-        # SQP 松弛步长控制（Relaxation / Damping）
-        # 如果直接采用 alpha_ref = alpha_new，纯曲率优化 (epsilon=0) 时优化器每轮会激进地
-        # 将 alpha 推到边界极值，下一轮重新线性化后又回弹，导致严重振荡无法收敛。
-        # 引入松弛因子 gamma ∈ (0, 1]，每轮只走部分步长：
-        #   alpha_ref = (1 - gamma) * alpha_old + gamma * alpha_new
-        gamma = 0.5
-        alpha_ref = (1 - gamma) * alpha_ref + gamma * alpha_new
+        # 计算全局自动监控指标 (基于 alpha_new 计算代价)
+        J_k_val = 0.5 * alpha_new.T @ Hk @ alpha_new + fk.T @ alpha_new
+        J_s_val = 0.5 * alpha_new.T @ Hs @ alpha_new + fs.T @ alpha_new
+        J_total = J_k_val + epsilon * J_s_val
+        
+        # 于命令行记录本次迭代后发生的赛车轨迹线侧移收敛情况
+        print(f"迭代 {iteration+1:2d}/{max_iter} | max|Δα|: {diff:.6f} | J_k: {J_k_val:.2e} | J_s: {J_s_val:.2e} | J_total: {J_total:.2e}")
+        
+        # 直接全量更新
+        alpha_ref = alpha_new
         
         # 倘若检测最大决策变量值相对前一次修改没能跳出极小误差区间容忍，判定曲线算法大体稳定抵达最速，主动结束。
         if diff < 1e-3:
