@@ -292,7 +292,7 @@ def calculate_wv_per_point(r, v, l_v, b_v):
     
     return wv
 
-def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
+def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6, gamma_normal=0.5, gamma_inaccurate=0.1):
     """
     使用 OSQP 进行 SQP 序列二次规划迭代，求解最优轨迹 $\alpha$。
     """
@@ -389,15 +389,22 @@ def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
         # 开始运行内部大规模方程推手并记录其操作日志结果给 res 承装变量
         res = prob.solve()
         
-        # 如果优化内核由于步长或溢出抛出未能完成 solved 阶段求解就打印告警提示
-        if res.info.status != 'solved':
-            print(f"迭代 {iteration+1}: 求解器状态 '{res.info.status}'")
-            # 出于健壮性，当无有效解阵(None)被吐出那么就立马拉停当前循环退出，反之勉强吃下近似解进行下一次抢救
-            if res.x is None:
-                break
-        
-        # 提取在约束下完成更新的新阶段每个离散点分配权重参数，存在新对象 \alpha_new 中
+        # 提取在约束下完成更新的新阶段每个离散点分配权重参数
         alpha_new = res.x
+        
+        # 如果优化内核未能完成 solved 阶段求解就打印告警提示
+        if res.info.status == 'solved':
+            gamma_adaptive = gamma_normal # 正常解的保守步长
+        elif res.info.status == 'solved inaccurate':
+            print(f"迭代 {iteration+1:2d}: 求解器状态 '{res.info.status}'，启用自适应收缩步长保护。")
+            gamma_adaptive = gamma_inaccurate # 极大降低本次步长权重抑制误差
+        else:
+            print(f"迭代 {iteration+1:2d}: 求解器状态异常 '{res.info.status}'，直接终止迭代以免污染轨迹。")
+            break
+            
+        if alpha_new is None:
+            break
+            
         diff = np.max(np.abs(alpha_new - alpha_ref))
         
         # 计算全局自动监控指标 (基于 alpha_new 计算代价)
@@ -408,8 +415,11 @@ def optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0, max_iter=6):
         # 于命令行记录本次迭代后发生的赛车轨迹线侧移收敛情况
         print(f"迭代 {iteration+1:2d}/{max_iter} | max|Δα|: {diff:.6f} | J_k: {J_k_val:.2e} | J_s: {J_s_val:.2e} | J_total: {J_total:.2e}")
         
-        # 直接全量更新
-        alpha_ref = alpha_new
+        # SQP 松弛步长控制（Relaxation / Damping）
+        # 如果直接采用 alpha_ref = alpha_new，纯曲率优化 (epsilon=0) 时优化器每轮会激进地
+        # 将 alpha 推到边界极值，下一轮重新线性化后又回弹，导致严重振荡无法收敛。
+        # 引入松弛因子 gamma ∈ (0, 1]，每轮只走部分步长：
+        alpha_ref = (1 - gamma_adaptive) * alpha_ref + gamma_adaptive * alpha_new
         
         # 倘若检测最大决策变量值相对前一次修改没能跳出极小误差区间容忍，判定曲线算法大体稳定抵达最速，主动结束。
         if diff < 1e-3:
@@ -430,13 +440,23 @@ if __name__ == '__main__':
     print("加载并解析轨迹数据...")
     p, q_bound, v = load_track_data('track.csv')
     
-    # 2. 计算纯最小曲率轨迹 (epsilon = 0)
+    # 2. 从主函数暴露 SQP 的收敛控制因子以便用户测试
+    gamma_normal = 0.5        # 大部分处于稳定计算状态下的正常牛顿步向界阻尼
+    gamma_inaccurate = 0.1    # 探底触碰了极端硬曲率导致 OSQP 报告 inaccurate 时的回撤微小阻尼
+    
+    # 3. 计算纯最小曲率轨迹 (epsilon = 0)
     print("\n--- 计算最小曲率轨迹 (epsilon = 0) ---")
-    r_opt_k, alpha_k = optimize_trajectory(p, v, l_v, b_v, ws, epsilon=0.0, max_iter=50)
+    r_opt_k, alpha_k = optimize_trajectory(
+        p, v, l_v, b_v, ws, epsilon=0.0, max_iter=50,
+        gamma_normal=gamma_normal, gamma_inaccurate=gamma_inaccurate
+    )
     
     # 3. 计算平衡轨迹 (epsilon = 1000.0)
     print("\n--- 计算平衡轨迹 (epsilon = 1000.0) ---")
-    r_opt_s, alpha_s = optimize_trajectory(p, v, l_v, b_v, ws, epsilon=1000.0, max_iter=50)
+    r_opt_s, alpha_s = optimize_trajectory(
+        p, v, l_v, b_v, ws, epsilon=1000.0, max_iter=50,
+        gamma_normal=gamma_normal, gamma_inaccurate=gamma_inaccurate
+    )
 
     # 4. 绘图
     # --- 主图：全赛道概览 + 弯道放大 + alpha 分布 ---
